@@ -1,8 +1,10 @@
+
 name: Start Copilot Coding Agent (GraphQL)
 
 on:
   issues:
     types: [opened, labeled]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,20 +15,43 @@ jobs:
   start-agent:
     runs-on: ubuntu-latest
 
-    # Parte SOLO se:
-    # - issue creata con label ai-request
-    # - oppure label ai-request aggiunta dopo
-    if: >
-      (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
-
     steps:
+      - name: Show trigger context (debug)
+        run: |
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Action: ${{ github.event.action }}"
+          echo "Repo: ${{ github.repository }}"
+          echo "Issue: #${{ github.event.issue.number }}"
+          echo "Labels raw:"
+          echo '${{ toJson(github.event.issue.labels) }}'
+
+      - name: Check label ai-request
+        id: lbl
+        run: |
+          # Se è workflow_dispatch non c'è un'issue => fermiamoci con un messaggio
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "has_label=false" >> $GITHUB_OUTPUT
+            echo "INFO: workflow_dispatch avviato. Questo workflow lavora su issue events."
+            exit 0
+          fi
+
+          LABELS='${{ toJson(github.event.issue.labels) }}'
+          if echo "$LABELS" | grep -q '"name":"ai-request"'; then
+            echo "has_label=true" >> $GITHUB_OUTPUT
+            echo "OK: label ai-request trovata, procedo."
+          else
+            echo "has_label=false" >> $GITHUB_OUTPUT
+            echo "INFO: label ai-request NON trovata, non faccio nulla."
+          fi
+
       - name: Install jq
+        if: steps.lbl.outputs.has_label == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
       - name: Assign issue to Copilot via GraphQL
+        if: steps.lbl.outputs.has_label == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
           OWNER: ${{ github.repository_owner }}
@@ -38,7 +63,7 @@ jobs:
           echo "Repo: $OWNER/$REPO - Issue: #$ISSUE_NUMBER"
 
           echo "== STEP 1: Read issue node_id via REST =="
-          # REST Issues endpoint: GET /repos/{owner}/{repo}/issues/{issue_number} [1](https://luke.geek.nz/azure/schedule-github-coding-agents/)
+          # REST: Get an issue [2](https://luke.geek.nz/azure/schedule-github-coding-agents/)
           ISSUE_JSON=$(curl -sS -L --fail-with-body \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -54,7 +79,7 @@ jobs:
           fi
 
           echo "== STEP 2: Get suggestedActors(CAN_BE_ASSIGNED) via GraphQL =="
-          # NIENTE read -d '' (fa exit 1 con bash -e). Usiamo cat in una variabile.
+          # GraphQL feature header richiesto per assegnazione a Copilot via API [1](https://github.com/microsoft/AL-Go)
           QUERY=$(cat <<'EOF'
           query($owner:String!, $name:String!) {
             repository(owner:$owner, name:$name) {
@@ -67,10 +92,9 @@ jobs:
                 }
               }
             }
-          }
-EOF
-          )
 
+          EOF
+          )
           PAYLOAD=$(jq -n --arg q "$QUERY" --arg owner "$OWNER" --arg name "$REPO" \
             '{query:$q, variables:{owner:$owner, name:$name}}')
 
@@ -94,7 +118,7 @@ EOF
 
           if [ -z "$COPILOT_ID" ] || [ "$COPILOT_ID" = "null" ]; then
             echo "ERROR: copilot-swe-agent NON trovato tra suggestedActors CAN_BE_ASSIGNED."
-            echo "=> Per questo repo Copilot non risulta assegnabile/capable in questo contesto."
+            echo "=> In questo repo Copilot non risulta assegnabile tramite suggestedActors."
             exit 1
           fi
 
@@ -104,8 +128,8 @@ EOF
             replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) {
               assignable { id }
             }
-          }
-EOF
+
+          EOF
           )
 
           MUT_PAYLOAD=$(jq -n --arg q "$MUTATION" --arg issueId "$ISSUE_NODE_ID" --arg actorId "$COPILOT_ID" \
