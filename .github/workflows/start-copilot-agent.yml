@@ -131,24 +131,25 @@ jobs:
           fi
 
           echo "== STEP 3: replaceActorsForAssignable (assign) =="
-          MUTATION='mutation($issueId:ID!, $actorIds:[ID!]!) { replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) { assignable { id } } }'
-
+          
+          MUTATION='mutation($issueId:ID!, $actorIds:[ID!]!) { replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) { assignable { __typename } } }'
+          
           MUT_PAYLOAD=$(jq -n --arg q "$MUTATION" --arg issueId "$ISSUE_NODE_ID" --arg actorId "$COPILOT_ID" \
             '{query:$q, variables:{issueId:$issueId, actorIds:[$actorId]}}')
-
+          
           ASSIGN=$(curl -sS -L --fail-with-body https://api.github.com/graphql \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
             -d "$MUT_PAYLOAD")
-
+          
           echo "GraphQL assign response:"
           echo "$ASSIGN" | jq .
-
+          
           ERR_COUNT2=$(echo "$ASSIGN" | jq '.errors | length // 0')
           if [ "$ERR_COUNT2" -gt 0 ]; then
             echo "ERROR: GraphQL errors in assign mutation"
             exit 1
           fi
-
+          
           echo "✅ DONE: issue assegnata a copilot-swe-agent"
