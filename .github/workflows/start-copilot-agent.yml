@@ -12,12 +12,19 @@ jobs:
   start-agent:
     runs-on: ubuntu-latest
 
-    # parte solo quando la issue ha la label ai-request
+    # Esegue solo se:
+    # - issue creata con label ai-request
+    # - oppure label ai-request aggiunta dopo
     if: >
       (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
 
     steps:
+      - name: Ensure jq is installed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: Assign issue to Copilot via GraphQL
         env:
           GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
@@ -25,11 +32,11 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          set -e
+          set -euo pipefail
 
           echo "Repo: $OWNER/$REPO - Issue: #$ISSUE_NUMBER"
 
-          # 1) Recupero node_id della issue (serve per GraphQL)
+          # 1) Recupero node_id della issue via REST (serve per GraphQL)
           ISSUE_NODE_ID=$(curl -sS -L \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -40,7 +47,9 @@ jobs:
             exit 1
           fi
 
-          # 2) Trovo l'actorId del bot Copilot (copilot-swe-agent) tra i suggestedActors CAN_BE_ASSIGNED
+          echo "Issue node_id: $ISSUE_NODE_ID"
+
+          # 2) Trovo l'actorId del bot Copilot tra i suggestedActors assegnabili
           read -r -d '' QUERY << 'EOF'
           query($owner:String!, $name:String!) {
             repository(owner:$owner, name:$name) {
@@ -66,14 +75,14 @@ jobs:
 
           if [ -z "$COPILOT_ID" ] || [ "$COPILOT_ID" = "null" ]; then
             echo "ERROR: copilot-swe-agent non trovato tra suggestedActors CAN_BE_ASSIGNED."
-            echo "Output (diagnostica):"
+            echo "Diagnostica suggestedActors:"
             echo "$SUGGESTED" | jq .
             exit 1
           fi
 
           echo "Copilot actorId: $COPILOT_ID"
 
-          # 3) Assegno Copilot alla issue con replaceActorsForAssignable
+          # 3) Assegno Copilot alla issue (replaceActorsForAssignable)
           read -r -d '' MUTATION << 'EOF'
           mutation($issueId:ID!, $actorIds:[ID!]!) {
             replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) {
