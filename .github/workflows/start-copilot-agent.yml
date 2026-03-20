@@ -1,9 +1,14 @@
-name: Start Copilot Coding Agent (GraphQL)
+name: Assign Copilot on ai-request (GraphQL)
 
 on:
   issues:
     types: [opened, labeled]
   workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to process (only for manual runs)"
+        required: true
+        default: "0"
 
 permissions:
   contents: read
@@ -11,125 +16,139 @@ permissions:
   pull-requests: write
 
 jobs:
-  start-agent:
+  assign-copilot:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Show trigger context (debug)
+      - name: Install jq
         run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Determine issue number + check label ai-request
+        id: gate
+        env:
+          DISPATCH_ISSUE: ${{ inputs.issue_number }}
+        run: |
+          set -o pipefail
+
           echo "Event: $GITHUB_EVENT_NAME"
           echo "Action: ${{ github.event.action }}"
-          echo "Repo: ${{ github.repository }}"
-          echo "Issue: #${{ github.event.issue.number }}"
-          echo "Labels:"
-          echo '${{ toJson(github.event.issue.labels) }}'
 
-      - name: Check label ai-request
-        id: lbl
-        run: |
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          # 1) Determina issue number
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            ISSUE_NUMBER="$DISPATCH_ISSUE"
+          else
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+          fi
+
+          if [ -z "$ISSUE_NUMBER" ] || [ "$ISSUE_NUMBER" = "0" ]; then
             echo "has_label=false" >> "$GITHUB_OUTPUT"
-            echo "INFO: workflow_dispatch – nessuna issue."
+            echo "issue_number=0" >> "$GITHUB_OUTPUT"
+            echo "INFO: issue_number non valido. Esco."
             exit 0
           fi
 
-          LABELS='${{ toJson(github.event.issue.labels) }}'
-          if echo "$LABELS" | grep -q '"name":"ai-request"'; then
-            echo "has_label=true" >> "$GITHUB_OUTPUT"
-            echo "OK: label ai-request trovata."
-          else
-            echo "has_label=false" >> "$GITHUB_OUTPUT"
-            echo "INFO: label ai-request NON trovata."
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "Issue number: #$ISSUE_NUMBER"
+
+          # 2) Se NON è workflow_dispatch: controlla label nel payload evento (robusto con jq)
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            LABELS_JSON='${{ toJson(github.event.issue.labels) }}'
+            echo "Labels payload: $LABELS_JSON"
+
+            if echo "$LABELS_JSON" | jq -e '.[] | select(.name == "ai-request")' >/dev/null; then
+              echo "has_label=true" >> "$GITHUB_OUTPUT"
+              echo "OK: label ai-request trovata."
+            else
+              echo "has_label=false" >> "$GITHUB_OUTPUT"
+              echo "INFO: label ai-request NON trovata. Esco senza fare nulla."
+            fi
+
+            exit 0
           fi
 
+          # 3) Se workflow_dispatch: non abbiamo labels nel payload, quindi continuiamo (test manuale)
+          echo "has_label=true" >> "$GITHUB_OUTPUT"
+          echo "OK: workflow_dispatch -> continuo (test manuale)."
+
       - name: Assign issue to Copilot via GraphQL
-        if: steps.lbl.outputs.has_label == 'true'
+        if: steps.gate.outputs.has_label == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ steps.gate.outputs.issue_number }}
         run: |
-          set -euo pipefail
+          set -o pipefail
+
+          echo "Repo: $OWNER/$REPO - Issue: #$ISSUE_NUMBER"
 
           echo "== STEP 1: Read issue node_id via REST =="
-          ISSUE_JSON=$(curl -sS -L \
+          # REST endpoint "Get an issue" [1](https://luke.geek.nz/azure/schedule-github-coding-agents/)
+          ISSUE_JSON=$(curl -sS -L --fail-with-body \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE_NUMBER")
 
-          ISSUE_NODE_ID=$(echo "$ISSUE_JSON" | jq -r '.node_id')
+          ISSUE_NODE_ID=$(echo "$ISSUE_JSON" | jq -r .node_id)
           echo "Issue node_id: $ISSUE_NODE_ID"
 
           if [ -z "$ISSUE_NODE_ID" ] || [ "$ISSUE_NODE_ID" = "null" ]; then
-            echo "ERROR: node_id mancante"
+            echo "ERROR: node_id mancante nella issue"
             echo "$ISSUE_JSON" | jq .
             exit 1
           fi
 
-          echo "== STEP 2: Get suggestedActors(CAN_BE_ASSIGNED) via GraphQL =="
-          GQL_QUERY='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){suggestedActors(capabilities:[CAN_BE_ASSIGNED],first:100){nodes{login __typename ...on Bot{id} ...on User{id}}}}}'
+          echo "== STEP 2: suggestedActors(CAN_BE_ASSIGNED) via GraphQL =="
+          # Header richiesto per assegnazione a Copilot via GraphQL [2](https://github.com/microsoft/AL-Go)
+          QUERY='query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { suggestedActors(capabilities:[CAN_BE_ASSIGNED], first:100) { nodes { login __typename ... on Bot { id } ... on User { id } } } } }'
 
-          PAYLOAD=$(jq -n \
-            --arg q "$GQL_QUERY" \
-            --arg owner "$OWNER" \
-            --arg name "$REPO" \
+          PAYLOAD=$(jq -n --arg q "$QUERY" --arg owner "$OWNER" --arg name "$REPO" \
             '{query:$q, variables:{owner:$owner, name:$name}}')
 
-          SUGGESTED=$(curl -sS -L \
+          SUGGESTED=$(curl -sS -L --fail-with-body https://api.github.com/graphql \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
-            -d "$PAYLOAD" \
-            https://api.github.com/graphql)
+            -d "$PAYLOAD")
 
-          echo "suggestedActors response:"
+          echo "GraphQL suggestedActors response:"
           echo "$SUGGESTED" | jq .
 
           ERR_COUNT=$(echo "$SUGGESTED" | jq '.errors | length // 0')
           if [ "$ERR_COUNT" -gt 0 ]; then
-            echo "ERROR: GraphQL ha restituito errori in suggestedActors"
+            echo "ERROR: GraphQL errors in suggestedActors"
             exit 1
           fi
 
-          # Cerca copilot-swe-agent oppure copilot
-          COPILOT_ID=$(echo "$SUGGESTED" | jq -r '
-            .data.repository.suggestedActors.nodes[]
-            | select(.login == "copilot-swe-agent" or .login == "copilot")
-            | .id' | head -n 1)
-
+          COPILOT_ID=$(echo "$SUGGESTED" | jq -r '.data.repository.suggestedActors.nodes[]? | select(.login=="copilot-swe-agent") | .id' | head -n 1)
           echo "Copilot actorId: $COPILOT_ID"
 
           if [ -z "$COPILOT_ID" ] || [ "$COPILOT_ID" = "null" ]; then
-            echo "ERROR: copilot-swe-agent NON trovato tra suggestedActors."
-            echo "Actors disponibili:"
-            echo "$SUGGESTED" | jq '.data.repository.suggestedActors.nodes[].login'
+            echo "ERROR: copilot-swe-agent NON trovato tra suggestedActors CAN_BE_ASSIGNED."
             exit 1
           fi
 
-          echo "== STEP 3: Assign Copilot to issue via GraphQL =="
-          GQL_MUTATION='mutation($assignableId:ID!,$assigneeIds:[ID!]!){addAssigneesToAssignable(input:{assignableId:$assignableId,assigneeIds:$assigneeIds}){assignable{...on Issue{id}}}}'
+          echo "== STEP 3: replaceActorsForAssignable (assign) =="
+          MUTATION='mutation($issueId:ID!, $actorIds:[ID!]!) { replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) { assignable { id } } }'
 
-          MUT_PAYLOAD=$(jq -n \
-            --arg q "$GQL_MUTATION" \
-            --arg assignableId "$ISSUE_NODE_ID" \
-            --arg copilotId "$COPILOT_ID" \
-            '{query:$q, variables:{assignableId:$assignableId, assigneeIds:[$copilotId]}}')
+          MUT_PAYLOAD=$(jq -n --arg q "$MUTATION" --arg issueId "$ISSUE_NODE_ID" --arg actorId "$COPILOT_ID" \
+            '{query:$q, variables:{issueId:$issueId, actorIds:[$actorId]}}')
 
-          ASSIGN=$(curl -sS -L \
+          ASSIGN=$(curl -sS -L --fail-with-body https://api.github.com/graphql \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
-            -d "$MUT_PAYLOAD" \
-            https://api.github.com/graphql)
+            -d "$MUT_PAYLOAD")
 
-          echo "Assign response:"
+          echo "GraphQL assign response:"
           echo "$ASSIGN" | jq .
 
           ERR_COUNT2=$(echo "$ASSIGN" | jq '.errors | length // 0')
           if [ "$ERR_COUNT2" -gt 0 ]; then
-            echo "ERROR: mutation ha restituito errori"
+            echo "ERROR: GraphQL errors in assign mutation"
             exit 1
           fi
 
-          echo "SUCCESS: Issue #$ISSUE_NUMBER assegnata a Copilot."
+          echo "✅ DONE: issue assegnata a copilot-swe-agent"
