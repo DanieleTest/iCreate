@@ -7,14 +7,15 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 jobs:
   start-agent:
     runs-on: ubuntu-latest
 
     # Parte SOLO se:
-    # - la issue viene creata con label ai-request
-    # - oppure la label ai-request viene aggiunta dopo
+    # - issue creata con label ai-request
+    # - oppure label ai-request aggiunta dopo
     if: >
       (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
@@ -32,31 +33,29 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          set -u
           set -o pipefail
 
           echo "Repo: $OWNER/$REPO - Issue: #$ISSUE_NUMBER"
 
           echo "== STEP 1: Read issue node_id via REST =="
           # REST Issues endpoint: GET /repos/{owner}/{repo}/issues/{issue_number} [1](https://luke.geek.nz/azure/schedule-github-coding-agents/)
-          ISSUE_JSON=$(curl -sS -L \
+          ISSUE_JSON=$(curl -sS -L --fail-with-body \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE_NUMBER")
-
-          echo "$ISSUE_JSON" | jq . >/dev/null || { echo "ERROR: issue JSON non valido"; echo "$ISSUE_JSON"; exit 1; }
 
           ISSUE_NODE_ID=$(echo "$ISSUE_JSON" | jq -r .node_id)
           echo "Issue node_id: $ISSUE_NODE_ID"
 
           if [ -z "$ISSUE_NODE_ID" ] || [ "$ISSUE_NODE_ID" = "null" ]; then
             echo "ERROR: node_id mancante nella issue"
+            echo "$ISSUE_JSON" | jq .
             exit 1
           fi
 
           echo "== STEP 2: Get suggestedActors(CAN_BE_ASSIGNED) via GraphQL =="
-          # GitHub richiede questo header per l'assegnazione a Copilot via GraphQL [2](https://github.com/microsoft/AL-Go)
-          read -r -d '' QUERY << 'EOF'
+          # NIENTE read -d '' (fa exit 1 con bash -e). Usiamo cat in una variabile.
+          QUERY=$(cat <<'EOF'
           query($owner:String!, $name:String!) {
             repository(owner:$owner, name:$name) {
               suggestedActors(capabilities:[CAN_BE_ASSIGNED], first:100) {
@@ -69,12 +68,13 @@ jobs:
               }
             }
           }
-          EOF
+EOF
+          )
 
           PAYLOAD=$(jq -n --arg q "$QUERY" --arg owner "$OWNER" --arg name "$REPO" \
             '{query:$q, variables:{owner:$owner, name:$name}}')
 
-          SUGGESTED=$(curl -sS -L https://api.github.com/graphql \
+          SUGGESTED=$(curl -sS -L --fail-with-body https://api.github.com/graphql \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
@@ -94,23 +94,24 @@ jobs:
 
           if [ -z "$COPILOT_ID" ] || [ "$COPILOT_ID" = "null" ]; then
             echo "ERROR: copilot-swe-agent NON trovato tra suggestedActors CAN_BE_ASSIGNED."
-            echo "=> Significa che per questo repo Copilot non risulta assegnabile/capable in questo momento."
+            echo "=> Per questo repo Copilot non risulta assegnabile/capable in questo contesto."
             exit 1
           fi
 
-          echo "== STEP 3: Assign Copilot to the issue via GraphQL mutation =="
-          read -r -d '' MUTATION << 'EOF'
+          echo "== STEP 3: Assign Copilot to issue via GraphQL mutation =="
+          MUTATION=$(cat <<'EOF'
           mutation($issueId:ID!, $actorIds:[ID!]!) {
             replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) {
               assignable { id }
             }
           }
-          EOF
+EOF
+          )
 
           MUT_PAYLOAD=$(jq -n --arg q "$MUTATION" --arg issueId "$ISSUE_NODE_ID" --arg actorId "$COPILOT_ID" \
             '{query:$q, variables:{issueId:$issueId, actorIds:[$actorId]}}')
 
-          ASSIGN=$(curl -sS -L https://api.github.com/graphql \
+          ASSIGN=$(curl -sS -L --fail-with-body https://api.github.com/graphql \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
