@@ -1,0 +1,32 @@
+name: Auto-assign Copilot coding agent on labeled issues
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign-agent:
+    runs-on: ubuntu-latest
+
+    # Trigger: issue aperta o label aggiunta "ai-request"
+    if: >
+      (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
+
+    steps:
+      - name: Assign Copilot coding agent (agentic workflow)
+        env:
+          GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
+        run: |
+          echo "Triggering agent assignment for issue #${{ github.event.issue.number }}"
+
+          # NOTE:
+          # This workflow is intentionally a scaffold.
+          # The actual assignment is performed via "agentic workflows / assign-to-agent" pattern.
+          # See GitHub Agentic Workflows reference for assign-to-agent. 
+
+          echo "If your org/repo supports agentic workflows, plug the supported assign-to-agent action/step here."
