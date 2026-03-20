@@ -1,0 +1,36 @@
+
+name: Start Copilot Coding Agent
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  start-agent:
+    runs-on: ubuntu-latest
+
+    # Parte solo quando la issue ha la label 'ai-request'
+    if: >
+      (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
+
+    steps:
+      # PASSO A — Prepariamo i parametri da passare al Copilot Agent
+      - name: Prepare assignment
+        id: prep
+        run: |
+          echo "issue=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+
+      # PASSO B — Comando che FA PARTIRE il Copilot Agent
+      # (Questo è il "trigger" che GitHub usa per lanciare il coding agent)
+      - name: Assign task to Copilot agent
+        uses: github/agentic-workflows/assign-to-agent@v1
+        with:
+          agent: copilot
+          issue: ${{ steps.prep.outputs.issue }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
