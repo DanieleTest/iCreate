@@ -1,4 +1,31 @@
-- name: Assign issue to Copilot via GraphQL (debug)
+name: Start Copilot Coding Agent (GraphQL)
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  start-agent:
+    runs-on: ubuntu-latest
+
+    # Parte SOLO se:
+    # - la issue viene creata con label ai-request
+    # - oppure la label ai-request viene aggiunta dopo
+    if: >
+      (github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'ai-request')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ai-request')
+
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Assign issue to Copilot via GraphQL
         env:
           GH_TOKEN: ${{ secrets.GH_AGENT_TOKEN }}
           OWNER: ${{ github.repository_owner }}
@@ -10,7 +37,8 @@
 
           echo "Repo: $OWNER/$REPO - Issue: #$ISSUE_NUMBER"
 
-          echo "== STEP 1: read issue node_id (REST) =="
+          echo "== STEP 1: Read issue node_id via REST =="
+          # REST Issues endpoint: GET /repos/{owner}/{repo}/issues/{issue_number} [1](https://luke.geek.nz/azure/schedule-github-coding-agents/)
           ISSUE_JSON=$(curl -sS -L \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -26,7 +54,8 @@
             exit 1
           fi
 
-          echo "== STEP 2: query suggestedActors(CAN_BE_ASSIGNED) (GraphQL) =="
+          echo "== STEP 2: Get suggestedActors(CAN_BE_ASSIGNED) via GraphQL =="
+          # GitHub richiede questo header per l'assegnazione a Copilot via GraphQL [2](https://github.com/microsoft/AL-Go)
           read -r -d '' QUERY << 'EOF'
           query($owner:String!, $name:String!) {
             repository(owner:$owner, name:$name) {
@@ -51,13 +80,12 @@
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
             -d "$PAYLOAD")
 
-          echo "GraphQL suggestedActors raw response:"
+          echo "GraphQL suggestedActors response:"
           echo "$SUGGESTED" | jq .
 
-          # Se GraphQL risponde con errors, fermati e stampali
           ERR_COUNT=$(echo "$SUGGESTED" | jq '.errors | length // 0')
           if [ "$ERR_COUNT" -gt 0 ]; then
-            echo "ERROR: GraphQL ha restituito errori"
+            echo "ERROR: GraphQL ha restituito errori in suggestedActors"
             exit 1
           fi
 
@@ -65,12 +93,12 @@
           echo "Copilot actorId: $COPILOT_ID"
 
           if [ -z "$COPILOT_ID" ] || [ "$COPILOT_ID" = "null" ]; then
-            echo "ERROR: copilot-swe-agent NON presente tra suggestedActors CAN_BE_ASSIGNED."
-            echo "Questo indica che per il repo l'agente non è considerato assegnabile/capable in questo contesto."
+            echo "ERROR: copilot-swe-agent NON trovato tra suggestedActors CAN_BE_ASSIGNED."
+            echo "=> Significa che per questo repo Copilot non risulta assegnabile/capable in questo momento."
             exit 1
           fi
 
-          echo "== STEP 3: mutation replaceActorsForAssignable (GraphQL) =="
+          echo "== STEP 3: Assign Copilot to the issue via GraphQL mutation =="
           read -r -d '' MUTATION << 'EOF'
           mutation($issueId:ID!, $actorIds:[ID!]!) {
             replaceActorsForAssignable(input:{assignableId:$issueId, actorIds:$actorIds}) {
@@ -88,13 +116,13 @@
             -H "GraphQL-Features: issues_copilot_assignment_api_support" \
             -d "$MUT_PAYLOAD")
 
-          echo "GraphQL assign raw response:"
+          echo "GraphQL assign response:"
           echo "$ASSIGN" | jq .
 
           ERR_COUNT2=$(echo "$ASSIGN" | jq '.errors | length // 0')
           if [ "$ERR_COUNT2" -gt 0 ]; then
-            echo "ERROR: mutation ha restituito errori"
+            echo "ERROR: GraphQL mutation ha restituito errori"
             exit 1
           fi
 
-          echo "✅ Done: issue assegnata a copilot-swe-agent via GraphQL."
+          echo "✅ SUCCESS: Issue assegnata a copilot-swe-agent via GraphQL."
