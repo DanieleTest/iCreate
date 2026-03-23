@@ -154,6 +154,13 @@ jobs:
 
       - name: Install & run tests
         shell: pwsh
+        env:
+          # ── CONFIGURA QUI I TEST ──────────────────────────────────
+          # Nome della codeunit di test da eseguire
+          # Per eseguire TUTTI i test, lascia vuoto
+          TEST_CODEUNIT: 'AI Dev Request Tests'
+          # Nome di un singolo test method (opzionale, lascia vuoto per tutti)
+          TEST_METHOD: ''
         run: |
           $containerName = "${{ steps.container.outputs.container_name }}"
           $credential = [PSCredential]::new("admin", (ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force))
@@ -168,12 +175,27 @@ jobs:
             -sync `
             -skipVerification
 
-          # Run tests
-          $testResults = Run-TestsInBcContainer `
-            -containerName $containerName `
-            -credential $credential `
-            -XUnitResultFileName "$env:GITHUB_WORKSPACE/TestResults.xml" `
-            -returnTrueIfAllPassed
+          # Build test parameters
+          $testParams = @{
+            containerName       = $containerName
+            credential          = $credential
+            XUnitResultFileName = "$env:GITHUB_WORKSPACE/TestResults.xml"
+            returnTrueIfAllPassed = $true
+          }
+
+          # Filter by codeunit name if specified
+          if ($env:TEST_CODEUNIT -ne '') {
+            $testParams['testCodeunit'] = $env:TEST_CODEUNIT
+            Write-Host "Running tests from codeunit: $env:TEST_CODEUNIT"
+          }
+
+          # Filter by method name if specified
+          if ($env:TEST_METHOD -ne '') {
+            $testParams['testFunction'] = $env:TEST_METHOD
+            Write-Host "Running test method: $env:TEST_METHOD"
+          }
+
+          $testResults = Run-TestsInBcContainer @testParams
 
           if (-not $testResults) {
             Write-Error "Some tests failed. Check TestResults.xml."
@@ -207,9 +229,33 @@ jobs:
           name: al-app
           path: output
 
-      - name: Publish to BC Sandbox via Admin API
+      - name: Get OAuth2 token for BC Admin API
+        id: auth
         env:
-          BC_ADMIN_TOKEN: ${{ secrets.BC_ADMIN_TOKEN }}
+          BC_TENANT_ID: ${{ secrets.BC_TENANT_ID }}
+          BC_CLIENT_ID: ${{ secrets.BC_CLIENT_ID }}
+          BC_CLIENT_SECRET: ${{ secrets.BC_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          TOKEN_RESPONSE=$(curl -sS -X POST \
+            "https://login.microsoftonline.com/$BC_TENANT_ID/oauth2/v2.0/token" \
+            -d "client_id=$BC_CLIENT_ID" \
+            -d "client_secret=$BC_CLIENT_SECRET" \
+            -d "scope=https://api.businesscentral.dynamics.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "ERROR: Failed to get OAuth2 token"
+            echo "$TOKEN_RESPONSE" | jq .
+            exit 1
+          fi
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to BC Sandbox via Automation API
+        env:
+          BC_TOKEN: ${{ steps.auth.outputs.token }}
           BC_ENVIRONMENT: ${{ secrets.BC_SANDBOX_ENVIRONMENT }}
           BC_TENANT_ID: ${{ secrets.BC_TENANT_ID }}
         run: |
@@ -218,11 +264,11 @@ jobs:
           APP_FILE=$(ls output/*.app | head -1)
           echo "Publishing $APP_FILE to environment: $BC_ENVIRONMENT"
 
-          # Upload .app to BC automation API
+          # Upload via Automation API v2.0
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
-            "https://api.businesscentral.dynamics.com/admin/v2.21/applications/BusinessCentral/environments/$BC_ENVIRONMENT/apps/publish" \
-            -H "Authorization: Bearer $BC_ADMIN_TOKEN" \
+            "https://api.businesscentral.dynamics.com/v2.0/$BC_TENANT_ID/$BC_ENVIRONMENT/api/microsoft/automation/v2.0/companies" \
+            -H "Authorization: Bearer $BC_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             --data-binary "@$APP_FILE")
 
